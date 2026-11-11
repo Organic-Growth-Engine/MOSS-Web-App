@@ -1,49 +1,49 @@
 "use client"
 
-import { ChevronsUpDown, LogOut, Moon, Sun } from "lucide-react"
+import Link from "next/link"
+import { LogOut, Moon, Settings, Sun } from "lucide-react"
 import { useTheme } from "next-themes"
 
-import { Avatar, AvatarFallback } from "@/components/ui/avatar"
+import { currentUser } from "@/lib/data/mock"
+import { InitialsAvatar } from "@/components/shared/initials-avatar"
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { SidebarMenu, SidebarMenuButton, SidebarMenuItem } from "@/components/ui/sidebar"
 
 export function UserMenu() {
   const { resolvedTheme, setTheme } = useTheme()
   const isDark = resolvedTheme === "dark"
 
   return (
-    <SidebarMenu>
-      <SidebarMenuItem>
-        <DropdownMenu>
-          <DropdownMenuTrigger render={<SidebarMenuButton size="lg" />}>
-            <Avatar className="size-8 rounded-lg">
-              <AvatarFallback className="rounded-lg">U</AvatarFallback>
-            </Avatar>
-            <div className="grid flex-1 text-left text-sm leading-tight">
-              <span className="truncate font-medium">User</span>
-              <span className="truncate text-xs text-muted-foreground">Workspace</span>
-            </div>
-            <ChevronsUpDown className="ml-auto size-4" />
-          </DropdownMenuTrigger>
-          <DropdownMenuContent side="top" align="start" className="min-w-56">
-            <DropdownMenuItem onClick={() => setTheme(isDark ? "light" : "dark")}>
-              {isDark ? <Sun /> : <Moon />}
-              {isDark ? "Light mode" : "Dark mode"}
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem>
-              <LogOut />
-              Log out
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </SidebarMenuItem>
-    </SidebarMenu>
+    <DropdownMenu>
+      <DropdownMenuTrigger className="rounded-full" aria-label={`Account menu for ${currentUser.name}`}>
+        <InitialsAvatar initials={currentUser.initials} size="sm" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="min-w-56">
+        <DropdownMenuLabel>
+          <span className="block text-sm font-semibold text-foreground">{currentUser.name}</span>
+          <span className="block text-xs font-normal text-muted-foreground">{currentUser.email}</span>
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem render={<Link href="/settings" />}>
+          <Settings />
+          Settings
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={() => setTheme(isDark ? "light" : "dark")}>
+          {isDark ? <Sun /> : <Moon />}
+          {isDark ? "Light mode" : "Dark mode"}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem render={<Link href="/login" />}>
+          <LogOut />
+          Log out
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }

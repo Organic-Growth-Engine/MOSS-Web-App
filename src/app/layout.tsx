@@ -1,32 +1,24 @@
 import type { Metadata } from "next"
-import { Geist, Geist_Mono } from "next/font/google"
+import { Inter } from "next/font/google"
 
 import { Providers } from "@/components/providers"
+import { brand } from "@/config/brand"
 import "./globals.css"
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-})
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
+const inter = Inter({
+  variable: "--font-inter",
   subsets: ["latin"],
 })
 
 export const metadata: Metadata = {
-  title: { default: "MOSS", template: "%s · MOSS" },
-  description: "Automation platform",
+  title: { default: brand.displayName, template: `%s · ${brand.displayName}` },
+  description: "Plan, create and publish to every platform from one place.",
 }
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
-    <html
-      lang="en"
-      suppressHydrationWarning
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
-    >
-      <body className="min-h-full">
+    <html lang="en" suppressHydrationWarning className={`${inter.variable} h-full`}>
+      <body className="min-h-full bg-background">
         <Providers>{children}</Providers>
       </body>
     </html>

@@ -1,19 +1,25 @@
 import { AppSidebar } from "@/components/layout/app-sidebar"
-import { Separator } from "@/components/ui/separator"
-import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar"
+import { AppTopbar, MobileHeader, MobileTabBar } from "@/components/layout/app-header"
 
 export default function AppLayout({ children }: LayoutProps<"/">) {
   return (
-    <SidebarProvider>
+    <div className="min-h-dvh lg:pl-56">
+      <a
+        href="#main"
+        className="sr-only z-50 rounded-md bg-primary px-3 py-2 text-primary-foreground focus:not-sr-only focus:fixed focus:top-3 focus:left-3"
+      >
+        Skip to content
+      </a>
       <AppSidebar />
-      <SidebarInset>
-        <header className="sticky top-0 z-10 flex h-14 shrink-0 items-center gap-2 border-b bg-background/80 px-4 backdrop-blur">
-          <SidebarTrigger className="-ml-1" />
-          <Separator orientation="vertical" className="mx-1 h-4" />
-          {/* Breadcrumbs / search / notifications go here once the design is in. */}
-        </header>
-        <div className="flex flex-1 flex-col gap-6 p-4 md:p-6">{children}</div>
-      </SidebarInset>
-    </SidebarProvider>
+      <AppTopbar />
+      <MobileHeader />
+      <main
+        id="main"
+        className="mx-auto w-full max-w-[1280px] px-4 pt-6 pb-28 sm:px-6 lg:px-8 lg:pt-10 lg:pb-12"
+      >
+        {children}
+      </main>
+      <MobileTabBar />
+    </div>
   )
 }
