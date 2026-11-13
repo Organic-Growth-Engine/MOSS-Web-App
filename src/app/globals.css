@@ -1,0 +1,162 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono);
+  --font-heading: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-primary-soft: var(--primary-soft);
+  --color-destructive-soft: var(--destructive-soft);
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/* Origin design tokens — taken from the Figma screens. */
+:root {
+  --background: #f7f7f9; /* page */
+  --foreground: #1f2024;
+  --card: #ffffff;
+  --card-foreground: #1f2024;
+  --popover: #ffffff;
+  --popover-foreground: #1f2024;
+  --primary: #5753da;
+  --primary-foreground: #ffffff;
+  --primary-soft: #eeedfc;
+  --secondary: #f2f2f5;
+  --secondary-foreground: #1f2024;
+  --muted: #f2f2f5;
+  --muted-foreground: #6b6e76;
+  --accent: #eeedfc;
+  --accent-foreground: #5753da;
+  --destructive: #c53030;
+  --destructive-soft: #fcefef;
+  --success: #1e7a46;
+  --success-soft: #eaf6ee;
+  --warning: #8a5a00;
+  --warning-soft: #fff6e6;
+  --info: #2f6fd6;
+  --info-soft: #eaf1fd;
+  --border: #e6e6eb;
+  --input: #e2e2e8;
+  --ring: #5753da;
+  --chart-1: #5753da;
+  --chart-2: #dddcf7;
+  --chart-3: #a9a7ee;
+  --chart-4: #1e7a46;
+  --chart-5: #8a5a00;
+  --radius: 0.5rem;
+  --sidebar: #ffffff;
+  --sidebar-foreground: #1f2024;
+  --sidebar-primary: #5753da;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #eeedfc;
+  --sidebar-accent-foreground: #5753da;
+  --sidebar-border: #e6e6eb;
+  --sidebar-ring: #5753da;
+}
+
+.dark {
+  --background: #121316;
+  --foreground: #ececef;
+  --card: #1b1c20;
+  --card-foreground: #ececef;
+  --popover: #1b1c20;
+  --popover-foreground: #ececef;
+  --primary: #6c68e8;
+  --primary-foreground: #ffffff;
+  --primary-soft: #2a2950;
+  --secondary: #26272c;
+  --secondary-foreground: #ececef;
+  --muted: #26272c;
+  --muted-foreground: #9a9ca4;
+  --accent: #2a2950;
+  --accent-foreground: #b3b1f5;
+  --destructive: #f07575;
+  --destructive-soft: #3a1f22;
+  --success: #5cc98a;
+  --success-soft: #1a2e23;
+  --warning: #f0c060;
+  --warning-soft: #33291a;
+  --info: #7aa8f5;
+  --info-soft: #1c2638;
+  --border: #2c2d33;
+  --input: #34353c;
+  --ring: #8784ef;
+  --chart-1: #7a76ee;
+  --chart-2: #34335c;
+  --chart-3: #5653a8;
+  --chart-4: #5cc98a;
+  --chart-5: #f0c060;
+  --sidebar: #1b1c20;
+  --sidebar-foreground: #ececef;
+  --sidebar-primary: #6c68e8;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #2a2950;
+  --sidebar-accent-foreground: #c9c7fa;
+  --sidebar-border: #2c2d33;
+  --sidebar-ring: #8784ef;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* Visible keyboard focus everywhere: 2px indigo outline with a soft halo. */
+  :where(a, button, input, textarea, select, [tabindex]):focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 1px;
+    box-shadow: 0 0 0 4px color-mix(in oklab, var(--ring) 18%, transparent);
+  }
+}
