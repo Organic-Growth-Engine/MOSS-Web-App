@@ -10,20 +10,19 @@ import {
   type LucideIcon,
 } from "lucide-react"
 
-import { postCounts } from "@/lib/data/mock"
-
 export type NavItem = {
   title: string
   href: string
   icon: LucideIcon
-  badge?: number
+  /** Which live count to show next to the item. */
+  badge?: "posts"
 }
 
 export const mainNav: NavItem[] = [
   { title: "Dashboard", href: "/", icon: LayoutGrid },
   { title: "Compose", href: "/compose", icon: PenLine },
   { title: "Calendar", href: "/calendar", icon: CalendarDays },
-  { title: "Posts", href: "/posts", icon: Files, badge: postCounts.all },
+  { title: "Posts", href: "/posts", icon: Files, badge: "posts" },
   { title: "Media Library", href: "/media", icon: ImageIcon },
   { title: "Analytics", href: "/analytics", icon: BarChart3 },
   { title: "Accounts", href: "/accounts", icon: Link2 },

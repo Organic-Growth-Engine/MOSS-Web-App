@@ -1,5 +1,7 @@
 import { cn } from "@/lib/utils"
-import type { PlatformId } from "@/lib/data/types"
+import { platformMeta, type PlatformId } from "@/config/platforms"
+
+export { platformMeta }
 
 type IconProps = { className?: string; strokeWidth?: number }
 
@@ -51,20 +53,6 @@ const paths: Record<PlatformId, (p: { sw: number }) => React.ReactNode> = {
       <path d="M15.25 12v1.25a2.4 2.4 0 0 0 4.75 0V12a8 8 0 1 0-3.2 6.4" strokeWidth={sw} />
     </>
   ),
-}
-
-export const platformMeta: Record<
-  PlatformId,
-  { name: string; charLimit?: number; comingSoon?: boolean }
-> = {
-  instagram: { name: "Instagram", charLimit: 2200 },
-  linkedin: { name: "LinkedIn", charLimit: 3000 },
-  facebook: { name: "Facebook", charLimit: 63206 },
-  x: { name: "X", charLimit: 280 },
-  youtube: { name: "YouTube", charLimit: 5000 },
-  tiktok: { name: "TikTok", comingSoon: true },
-  pinterest: { name: "Pinterest", comingSoon: true },
-  threads: { name: "Threads", comingSoon: true },
 }
 
 /** Line-style platform glyph that inherits text color. */
