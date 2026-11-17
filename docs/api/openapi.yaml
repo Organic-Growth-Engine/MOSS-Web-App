@@ -1,0 +1,2395 @@
+openapi: 3.1.0
+info:
+  title: Origin API
+  version: 1.0.0
+  summary: Public HTTP API behind the Origin web app (social publishing for teams).
+  description: |
+    The Origin backend is a set of Node/Express microservices behind one API gateway.
+    Every path below is served from the gateway at `/api/v1`; the gateway routes each
+    request to the owning service by path (see the `x-service` value on each tag).
+
+    * Auth: OAuth 2.0 (Authorization Code + PKCE, Google) and first-party email/password,
+      both issued by identity-service. Send the access token as `Authorization: Bearer <jwt>`.
+    * The access token carries the caller's workspace roles as the `workspaces` claim
+      (`{ "<workspaceId>": "owner" | "admin" | "editor" }`); services authorize from it.
+    * Pagination: `page` (1-based) + `pageSize`; list responses return `{ data, meta }`.
+    * Errors always use the `ErrorResponse` shape.
+    * Live updates: `GET /workspaces/{workspaceId}/events` streams Server-Sent Events (notifications,
+      post status, account health, fresh metrics) so the UI updates without reloading.
+
+    The human-readable companion is `docs/api/API_SPEC.md`; the two must stay in sync.
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: /api/v1
+    description: API gateway (same origin as the web app)
+security:
+  - bearerAuth: []
+tags:
+  - name: Identity
+    description: Sign-in (Google OAuth, email/password), sign-up, password reset, invitations, current user. Owned by identity-service.
+    x-service: identity-service
+  - name: Workspace
+    description: Workspaces, members, invitations, plan, Stripe billing. Owned by workspace-service.
+    x-service: workspace-service
+  - name: Accounts
+    description: Social account connections (platform OAuth). Owned by accounts-service.
+    x-service: accounts-service
+  - name: Content
+    description: Posts, destinations, publishing, calendar, hashtag suggestions, exports. Owned by content-service.
+    x-service: content-service
+  - name: Media
+    description: Media library, folders, uploads, storage. Owned by media-service.
+    x-service: media-service
+  - name: Analytics
+    description: Performance metrics and reports. Owned by analytics-service.
+    x-service: analytics-service
+  - name: Notifications
+    description: In-app notifications and per-user notification preferences. Owned by notification-service.
+    x-service: notification-service
+  - name: Search
+    description: Cross-entity search, implemented in the API gateway by fanning out to content, media and accounts services.
+    x-service: api-gateway
+
+paths:
+  # ───────────────────────────── Identity ─────────────────────────────
+  /auth/providers:
+    get:
+      tags: [Identity]
+      operationId: listAuthProviders
+      summary: List sign-in methods
+      description: Used by /login and /signup to render "Continue with Google" and the email/password form.
+      security: []
+      responses:
+        "200":
+          description: Available sign-in methods.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/AuthProvider" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /auth/authorize:
+    get:
+      tags: [Identity]
+      operationId: authorize
+      summary: Start OAuth sign-in (browser redirect)
+      description: |
+        The browser navigates here (it is not called with fetch). identity-service redirects
+        to the provider, handles the provider callback, then redirects to `redirect_uri`
+        with `code` and `state`. Used by /login, /signup and /invite/{token}.
+      security: []
+      parameters:
+        - { name: provider, in: query, required: true, schema: { type: string, enum: [google] } }
+        - { name: redirect_uri, in: query, required: true, schema: { type: string, format: uri }, description: "Must be a registered web-app URL, e.g. https://app.origin.example/auth/callback" }
+        - { name: code_challenge, in: query, required: true, schema: { type: string } }
+        - { name: code_challenge_method, in: query, required: true, schema: { type: string, enum: [S256] } }
+        - { name: state, in: query, required: true, schema: { type: string } }
+      responses:
+        "302":
+          description: Redirect to the identity provider.
+          headers:
+            Location: { schema: { type: string, format: uri } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /auth/oauth/callback/{provider}:
+    get:
+      tags: [Identity]
+      operationId: handleOAuthCallback
+      summary: Identity-provider callback (browser redirect)
+      description: Called by Google, never by the web app. Redirects to the original `redirect_uri` with `code` and `state`, or with `error`.
+      security: []
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string, enum: [google] } }
+        - { name: code, in: query, required: false, schema: { type: string } }
+        - { name: state, in: query, required: true, schema: { type: string } }
+        - { name: error, in: query, required: false, schema: { type: string } }
+      responses:
+        "302":
+          description: Redirect back to the web app.
+          headers:
+            Location: { schema: { type: string, format: uri } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /auth/token:
+    post:
+      tags: [Identity]
+      operationId: exchangeToken
+      summary: Exchange an authorization code, or refresh the session
+      description: |
+        `authorization_code` finishes Google sign-in (/auth/callback). `refresh_token` uses the
+        httpOnly refresh cookie and is called by the HTTP client on startup and after a 401.
+        Sets a rotated `origin_refresh` cookie (HttpOnly; Secure; SameSite=Strict; Path=/api/v1/auth).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TokenRequest" }
+      responses:
+        "200":
+          description: New access token.
+          headers:
+            Set-Cookie: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /auth/password/login:
+    post:
+      tags: [Identity]
+      operationId: loginWithPassword
+      summary: Sign in with email and password
+      description: Used by the /login email form. Sets the refresh cookie.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PasswordLoginRequest" }
+      responses:
+        "200":
+          description: Signed in.
+          headers:
+            Set-Cookie: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /auth/signup:
+    post:
+      tags: [Identity]
+      operationId: signUp
+      summary: Create a user and their first workspace
+      description: Used by /signup. identity-service creates the user, then asks workspace-service to create the workspace with the user as owner.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SignUpRequest" }
+      responses:
+        "201":
+          description: Account created and signed in.
+          headers:
+            Set-Cookie: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /auth/password-resets:
+    post:
+      tags: [Identity]
+      operationId: requestPasswordReset
+      summary: Email a password-reset link
+      description: Used by /forgot-password. Always returns 202 so it cannot be used to discover accounts.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PasswordResetRequest" }
+      responses:
+        "202": { description: "Accepted. If the email belongs to a password account, a link was sent." }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /auth/password-resets/confirm:
+    post:
+      tags: [Identity]
+      operationId: confirmPasswordReset
+      summary: Set a new password from a reset link
+      description: Used by /reset-password?token=…
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PasswordResetConfirmRequest" }
+      responses:
+        "204": { description: Password changed. All sessions were signed out. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /auth/logout:
+    post:
+      tags: [Identity]
+      operationId: logout
+      summary: Sign out
+      description: Used by the user menu. Revokes the refresh token and clears the cookie.
+      responses:
+        "204": { description: Signed out. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /invitations/{token}:
+    get:
+      tags: [Identity]
+      operationId: getInvitation
+      summary: Preview an invitation
+      description: Used by /invite/{token} before the invitee accepts.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/InvitationToken"
+      responses:
+        "200":
+          description: Invitation details.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InvitationPreview" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /invitations/{token}/accept:
+    post:
+      tags: [Identity]
+      operationId: acceptInvitation
+      summary: Accept an invitation
+      description: |
+        Signed-in callers (Bearer token, e.g. after Google sign-in) just join the workspace.
+        Anonymous callers must send `name` and `password` to create a password account.
+        Returns a fresh token whose `workspaces` claim includes the new workspace.
+      security:
+        - bearerAuth: []
+        - {}
+      parameters:
+        - $ref: "#/components/parameters/InvitationToken"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AcceptInvitationRequest" }
+      responses:
+        "200":
+          description: Joined the workspace.
+          headers:
+            Set-Cookie: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /users/me:
+    get:
+      tags: [Identity]
+      operationId: getCurrentUser
+      summary: Get the signed-in user
+      description: User menu, dashboard greeting, Settings → Your profile, "(you)" marker, workspace bootstrap.
+      responses:
+        "200":
+          description: The current user.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CurrentUser" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    patch:
+      tags: [Identity]
+      operationId: updateCurrentUser
+      summary: Update the signed-in user's profile
+      description: Settings → Your profile (Save changes). Email can only be changed by password accounts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateProfileRequest" }
+      responses:
+        "200":
+          description: Updated user.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /users/me/security:
+    get:
+      tags: [Identity]
+      operationId: getSecurityOverview
+      summary: Sign-in method, two-factor status and active sessions
+      description: Settings → Security. Two-factor authentication exists only for Google accounts and is managed by Google (the UI links to `twoFactor.manageUrl`); for email/password accounts `twoFactor` is null.
+      responses:
+        "200":
+          description: Security overview.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SecurityOverview" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /users/me/sessions/{sessionId}:
+    parameters:
+      - { name: sessionId, in: path, required: true, schema: { type: string }, example: ses_8a21 }
+    delete:
+      tags: [Identity]
+      operationId: revokeSession
+      summary: Sign out another session
+      description: Settings → Security → Sign out (on a session that isn't the current one). Revokes that session's refresh token; its access token stops working when it expires (≤ 15 min). Use logout for the current session.
+      responses:
+        "204": { description: Session revoked. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ───────────────────────────── Workspace ─────────────────────────────
+  /workspaces:
+    get:
+      tags: [Workspace]
+      operationId: listWorkspaces
+      summary: List the caller's workspaces
+      description: Workspace switcher.
+      responses:
+        "200":
+          description: Workspaces the caller belongs to.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/WorkspaceSummary" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    post:
+      tags: [Workspace]
+      operationId: createWorkspace
+      summary: Create a workspace
+      description: Workspace switcher → New workspace. The caller becomes owner; refresh the token afterwards to get the new role claim.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateWorkspaceRequest" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workspace" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Workspace]
+      operationId: getWorkspace
+      summary: Get a workspace
+      description: Sidebar (switcher, plan card), mobile header, dashboard subtitle, Settings (General, Billing), Accounts summary, timezone for all date formatting.
+      responses:
+        "200":
+          description: The workspace.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workspace" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    patch:
+      tags: [Workspace]
+      operationId: updateWorkspace
+      summary: Update workspace details
+      description: "Settings → Workspace details (Save changes). Role admin."
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateWorkspaceRequest" }
+      responses:
+        "200":
+          description: Updated workspace.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workspace" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/members:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Workspace]
+      operationId: listMembers
+      summary: List members
+      description: Settings → General (people panel) and Members tab; Billing seat usage.
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PageSize"
+        - { name: sort, in: query, required: false, schema: { type: string, enum: [name, -name, joinedAt, -joinedAt], default: joinedAt } }
+      responses:
+        "200":
+          description: A page of members.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MemberPage" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/members/{userId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - { name: userId, in: path, required: true, schema: { type: string }, example: usr_8c1d2e }
+    patch:
+      tags: [Workspace]
+      operationId: updateMember
+      summary: Change a member's role
+      description: Settings → role select (Save changes). Role admin; only an owner can grant or remove `owner`.
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateMemberRequest" }
+      responses:
+        "200":
+          description: Updated member.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Member" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/invitations:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      tags: [Workspace]
+      operationId: createInvitation
+      summary: Invite someone by email
+      description: Settings → Invite member. Sends an email with a link to /invite/{token}. Role admin.
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateInvitationRequest" }
+      responses:
+        "201":
+          description: Invitation sent.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Invitation" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/billing/portal-sessions:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      tags: [Workspace]
+      operationId: createBillingPortalSession
+      summary: Open the Stripe customer portal
+      description: Settings → Manage billing. Role owner.
+      x-required-role: owner
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BillingPortalRequest" }
+      responses:
+        "201":
+          description: Portal session created; redirect the browser to `url`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RedirectUrl" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/billing/checkout-sessions:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      tags: [Workspace]
+      operationId: createCheckoutSession
+      summary: Buy a paid add-on (Stripe Checkout)
+      description: |
+        Accounts → Connect account, after a 402 `PAYMENT_REQUIRED`: buys one extra social account
+        slot. The slot isn't tied to a platform: it can hold a second (or later) account on any
+        platform. Role owner.
+      x-required-role: owner
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CheckoutSessionRequest" }
+      responses:
+        "201":
+          description: Checkout session created; redirect the browser to `url`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RedirectUrl" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ───────────────────────────── Accounts ─────────────────────────────
+  /workspaces/{workspaceId}/social-accounts:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Accounts]
+      operationId: listSocialAccounts
+      summary: List social accounts
+      description: Accounts page, dashboard account health + reconnect callout, sidebar plan card, Compose destinations, Billing slot usage.
+      parameters:
+        - { name: platform, in: query, required: false, schema: { $ref: "#/components/schemas/Platform" } }
+        - { name: status, in: query, required: false, description: Comma-separated statuses., schema: { type: string }, example: "expired,expires_soon" }
+      responses:
+        "200":
+          description: Accounts in the workspace (not paginated; bounded by plan slots).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/SocialAccount" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/social-accounts/connections:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      tags: [Accounts]
+      operationId: startSocialAccountConnection
+      summary: Start connecting a social account
+      description: |
+        Connect account dialog. Returns the platform authorization URL. The first account per
+        platform is included and becomes that platform's locked default. A second account on the
+        same platform needs a paid add-on: without a free add-on slot the call fails with 402
+        `PAYMENT_REQUIRED`. Role admin.
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StartConnectionRequest" }
+      responses:
+        "201":
+          description: Redirect the browser to `authorizationUrl`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthorizationRedirect" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "402": { $ref: "#/components/responses/PaymentRequired" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/social-accounts/{accountId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/AccountId"
+    get:
+      tags: [Accounts]
+      operationId: getSocialAccount
+      summary: Get a social account
+      description: Accounts → Manage connection dialog.
+      responses:
+        "200":
+          description: The account.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SocialAccount" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    delete:
+      tags: [Accounts]
+      operationId: disconnectSocialAccount
+      summary: Disconnect a paid extra account
+      description: |
+        Accounts → Disconnect (Manage connection). Only paid add-on accounts can be disconnected;
+        the platform's default account is locked and returns 409 `ACCOUNT_LOCKED`. The freed
+        add-on slot stays purchased. Role admin.
+      x-required-role: admin
+      responses:
+        "204": { description: Disconnected and removed. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/social-accounts/{accountId}/reconnect:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/AccountId"
+    post:
+      tags: [Accounts]
+      operationId: reconnectSocialAccount
+      summary: Re-authorize an account
+      description: |
+        Reconnect buttons (dashboard, accounts callout, account cards) and Connect on a
+        `not_connected` card. The platform must return the same account; a different one fails
+        the callback with `error=account_mismatch`. Role admin.
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReconnectRequest" }
+      responses:
+        "201":
+          description: Redirect the browser to `authorizationUrl`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthorizationRedirect" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /social-accounts/oauth/callback/{platform}:
+    get:
+      tags: [Accounts]
+      operationId: handleSocialOAuthCallback
+      summary: Platform OAuth callback (browser redirect)
+      description: |
+        Called by the social platform, never by the web app. Redirects to
+        `/accounts?connected={accountId}` or `/accounts?error={code}` (codes:
+        `access_denied`, `account_mismatch`, `missing_permissions`).
+      security: []
+      parameters:
+        - { name: platform, in: path, required: true, schema: { $ref: "#/components/schemas/Platform" } }
+        - { name: code, in: query, required: false, schema: { type: string } }
+        - { name: state, in: query, required: true, schema: { type: string } }
+        - { name: error, in: query, required: false, schema: { type: string } }
+      responses:
+        "302":
+          description: Redirect back to the web app.
+          headers:
+            Location: { schema: { type: string } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ───────────────────────────── Content ─────────────────────────────
+  /workspaces/{workspaceId}/posts:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Content]
+      operationId: listPosts
+      summary: List posts
+      description: Posts page (tabs, search, platform filter, pagination); dashboard "Up next" and "Recent publishing activity"; calendar "Next scheduled".
+      parameters:
+        - $ref: "#/components/parameters/PostStatusFilter"
+        - $ref: "#/components/parameters/PlatformFilter"
+        - $ref: "#/components/parameters/SearchQuery"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PageSize"
+        - { name: sort, in: query, required: false, schema: { type: string, enum: [publishAt, -publishAt, updatedAt, -updatedAt], default: -publishAt }, description: "Posts without publishAt always sort last, most recently edited first." }
+      responses:
+        "200":
+          description: A page of posts.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PostPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    post:
+      tags: [Content]
+      operationId: createPost
+      summary: Create a draft post
+      description: Compose → first Save draft / autosave / Schedule / Publish now. Destinations are given by platform; the server picks that platform's default account. Role editor.
+      x-required-role: editor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PostInput" }
+      responses:
+        "201":
+          description: Draft created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Post" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/posts/counts:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Content]
+      operationId: getPostCounts
+      summary: Count posts by status
+      description: Posts tab counts, sidebar Posts badge, calendar "This week" (with from/to).
+      parameters:
+        - $ref: "#/components/parameters/PlatformFilter"
+        - $ref: "#/components/parameters/SearchQuery"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: Counts.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PostCounts" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/posts/publishing-stats:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Content]
+      operationId: getPublishingStats
+      summary: Publishing results for a period
+      description: Dashboard "Posts published" tile.
+      parameters:
+        - $ref: "#/components/parameters/FromRequired"
+        - $ref: "#/components/parameters/ToRequired"
+      responses:
+        "200":
+          description: Publishing stats.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublishingStats" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/posts/export:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Content]
+      operationId: exportPosts
+      summary: Export posts as CSV or PDF
+      description: Posts → Export. Accepts the same filters as listPosts (no pagination).
+      parameters:
+        - $ref: "#/components/parameters/ExportFormat"
+        - $ref: "#/components/parameters/PostStatusFilter"
+        - $ref: "#/components/parameters/PlatformFilter"
+        - $ref: "#/components/parameters/SearchQuery"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: The export file.
+          headers:
+            Content-Disposition: { schema: { type: string }, example: 'attachment; filename="posts-2026-03-23.csv"' }
+          content:
+            text/csv:
+              schema: { type: string }
+            application/pdf:
+              schema: { type: string, contentMediaType: application/pdf }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/posts/hashtag-suggestions:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      tags: [Content]
+      operationId: suggestHashtags
+      summary: AI-generated hashtag suggestions
+      description: Compose → Suggest hashtags. Backed by a free AI model chosen by the backend; no rate limit for now. Role editor.
+      x-required-role: editor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/HashtagSuggestionRequest" }
+      responses:
+        "200":
+          description: Suggested hashtags, best first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HashtagSuggestions" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/posts/{postId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/PostId"
+    get:
+      tags: [Content]
+      operationId: getPost
+      summary: Get a post
+      description: /posts/{postId} detail page, Compose edit mode (/compose?postId=…).
+      responses:
+        "200":
+          description: The post.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Post" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    patch:
+      tags: [Content]
+      operationId: updatePost
+      summary: Update a draft or scheduled post
+      description: |
+        Compose autosave and Save draft. Only `draft` and `scheduled` posts can be edited
+        (otherwise 409 `INVALID_STATE`). `destinations`, when sent, replaces the whole list. Role editor.
+      x-required-role: editor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdatePostRequest" }
+      responses:
+        "200":
+          description: Updated post.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Post" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    delete:
+      tags: [Content]
+      operationId: deletePost
+      summary: Delete a post
+      description: Posts row menu → Delete; post detail → Delete. Removes it from Origin only; already-published platform posts stay up. 409 while `publishing`. Role editor.
+      x-required-role: editor
+      responses:
+        "204": { description: Deleted. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/posts/{postId}/schedule:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/PostId"
+    post:
+      tags: [Content]
+      operationId: schedulePost
+      summary: Schedule a post
+      description: Compose → Schedule. Moves a draft (or reschedules a scheduled post). 422 if publishAt is in the past, there are no destinations, or media doesn't suit a destination format. Role editor.
+      x-required-role: editor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SchedulePostRequest" }
+      responses:
+        "200":
+          description: Scheduled post.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Post" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/posts/{postId}/publish:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/PostId"
+    post:
+      tags: [Content]
+      operationId: publishPost
+      summary: Publish a post now
+      description: Compose → Publish now. Publishing is asynchronous; the post comes back as `publishing` and destinations settle later (poll getPost or watch notifications). Role editor.
+      x-required-role: editor
+      responses:
+        "202":
+          description: Publishing started.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Post" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/posts/{postId}/duplicate:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/PostId"
+    post:
+      tags: [Content]
+      operationId: duplicatePost
+      summary: Duplicate a post as a new draft
+      description: Posts row menu → Duplicate; post detail → Duplicate. Role editor.
+      x-required-role: editor
+      responses:
+        "201":
+          description: The new draft.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Post" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/posts/{postId}/destinations/{destinationId}/retry:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/PostId"
+      - { name: destinationId, in: path, required: true, schema: { type: string }, example: dst_4b7e10 }
+    post:
+      tags: [Content]
+      operationId: retryDestination
+      summary: Retry a failed destination
+      description: Post detail → Retry (reached from dashboard "Review"). 409 if the destination isn't `failed`; 422 if its account still needs reconnecting. Role editor.
+      x-required-role: editor
+      responses:
+        "202":
+          description: Retry started.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Post" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/calendar:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Content]
+      operationId: getCalendar
+      summary: Calendar entries for a date range
+      description: Calendar month / week / list views and the selected-day panel. Includes every post with a publishAt in range (drafts with a planned time included). Range is at most 62 days.
+      parameters:
+        - $ref: "#/components/parameters/FromRequired"
+        - $ref: "#/components/parameters/ToRequired"
+        - $ref: "#/components/parameters/PlatformFilter"
+      responses:
+        "200":
+          description: Entries ordered by publishAt.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/CalendarEntry" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ───────────────────────────── Media ─────────────────────────────
+  /workspaces/{workspaceId}/media:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Media]
+      operationId: listMedia
+      summary: List media assets
+      description: Media grid (folder, search, type, sort, Load more); Compose → Add media from library.
+      parameters:
+        - { name: folderId, in: query, required: false, schema: { type: string }, example: fld_spring }
+        - { name: kind, in: query, required: false, schema: { $ref: "#/components/schemas/MediaKind" } }
+        - $ref: "#/components/parameters/SearchQuery"
+        - { name: sort, in: query, required: false, schema: { type: string, enum: [createdAt, -createdAt], default: -createdAt } }
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: A page of assets.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MediaPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/media/storage:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Media]
+      operationId: getStorageUsage
+      summary: Storage usage and upload limits
+      description: Media footer ("1.8 GB of 10 GB used", accepted formats, max size).
+      responses:
+        "200":
+          description: Storage usage.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StorageUsage" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/media/uploads:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      tags: [Media]
+      operationId: createUpload
+      summary: Get a presigned upload URL
+      description: Media → Upload media; Compose → Add media. The browser then PUTs the file to `uploadUrl` and calls completeUpload. 409 if storage is full; 422 for an unsupported type or a file over 1 GB. Role editor.
+      x-required-role: editor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateUploadRequest" }
+      responses:
+        "201":
+          description: Upload ticket.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UploadTicket" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/media/uploads/{uploadId}/complete:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - { name: uploadId, in: path, required: true, schema: { type: string }, example: upl_92ac1f }
+    post:
+      tags: [Media]
+      operationId: completeUpload
+      summary: Finish an upload and create the asset
+      description: Called after the browser's PUT succeeds. The asset starts as `processing` (thumbnails, duration, dimensions). Role editor.
+      x-required-role: editor
+      responses:
+        "201":
+          description: The new asset.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MediaAsset" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/media/{mediaId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/MediaId"
+    get:
+      tags: [Media]
+      operationId: getMedia
+      summary: Get a media asset
+      description: Compose attached-media details.
+      responses:
+        "200":
+          description: The asset.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MediaAsset" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    patch:
+      tags: [Media]
+      operationId: updateMedia
+      summary: Rename or move an asset
+      description: "Media card menu → Rename / Move to folder. `folderId: null` moves it out of all folders. Role editor."
+      x-required-role: editor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateMediaRequest" }
+      responses:
+        "200":
+          description: Updated asset.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MediaAsset" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    delete:
+      tags: [Media]
+      operationId: deleteMedia
+      summary: Delete an asset
+      description: Media card menu → Delete. 409 `CONFLICT` if a draft or scheduled post uses it. Role editor.
+      x-required-role: editor
+      responses:
+        "204": { description: Deleted. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/media-folders:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Media]
+      operationId: listMediaFolders
+      summary: List folders with asset counts
+      description: Media folder tiles; Move to folder options. `meta.totalAssets` feeds the "All assets" tile.
+      responses:
+        "200":
+          description: Folders.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MediaFolderList" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    post:
+      tags: [Media]
+      operationId: createMediaFolder
+      summary: Create a folder
+      description: Media → New folder. 409 if the name is taken. Role editor.
+      x-required-role: editor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateFolderRequest" }
+      responses:
+        "201":
+          description: Created folder.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MediaFolder" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ───────────────────────────── Analytics ─────────────────────────────
+  /workspaces/{workspaceId}/analytics/overview:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Analytics]
+      operationId: getAnalyticsOverview
+      summary: KPIs for a period vs. the previous period
+      description: |
+        Analytics KPIs, comparison label, insight; dashboard KPI tiles and "+12.8% this month". The comparison
+        period is the same length, immediately before `from`. Metrics are as fresh as each platform reports
+        them (webhooks where offered, polling otherwise); `updatedAt` says when. A `metrics.updated` event on
+        the event stream tells the UI to refetch.
+      parameters:
+        - $ref: "#/components/parameters/FromRequired"
+        - $ref: "#/components/parameters/ToRequired"
+        - $ref: "#/components/parameters/PlatformFilter"
+      responses:
+        "200":
+          description: Overview.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AnalyticsOverview" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/analytics/timeseries:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Analytics]
+      operationId: getAnalyticsTimeseries
+      summary: Daily metric series (current and previous period)
+      description: Daily impressions chart on Analytics and the dashboard.
+      parameters:
+        - { name: metric, in: query, required: true, schema: { type: string, enum: [impressions, engagements] } }
+        - $ref: "#/components/parameters/FromRequired"
+        - $ref: "#/components/parameters/ToRequired"
+        - $ref: "#/components/parameters/PlatformFilter"
+        - { name: interval, in: query, required: false, schema: { type: string, enum: [day], default: day } }
+      responses:
+        "200":
+          description: One point per interval.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/TimeseriesPoint" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/analytics/platforms:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Analytics]
+      operationId: getPlatformMetrics
+      summary: Metrics per platform
+      description: Engagement-by-platform bars and the platform table; the platform filter options.
+      parameters:
+        - $ref: "#/components/parameters/FromRequired"
+        - $ref: "#/components/parameters/ToRequired"
+      responses:
+        "200":
+          description: One row per platform with a connected account.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/PlatformMetrics" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/analytics/best-times:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Analytics]
+      operationId: getBestTimes
+      summary: When the audience is most active
+      description: Calendar → This week ("Your audience is most active Tuesday and Thursday at 10 AM.").
+      responses:
+        "200":
+          description: Best posting times in the workspace timezone.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BestTimes" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/analytics/export:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Analytics]
+      operationId: exportAnalytics
+      summary: Export the analytics report as CSV or PDF
+      description: Analytics → Export report.
+      parameters:
+        - $ref: "#/components/parameters/ExportFormat"
+        - $ref: "#/components/parameters/FromRequired"
+        - $ref: "#/components/parameters/ToRequired"
+        - $ref: "#/components/parameters/PlatformFilter"
+      responses:
+        "200":
+          description: The report file.
+          headers:
+            Content-Disposition: { schema: { type: string }, example: 'attachment; filename="analytics-2026-03-01-2026-03-23.pdf"' }
+          content:
+            text/csv:
+              schema: { type: string }
+            application/pdf:
+              schema: { type: string, contentMediaType: application/pdf }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ───────────────────────────── Notifications ─────────────────────────────
+  /workspaces/{workspaceId}/notifications:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Notifications]
+      operationId: listNotifications
+      summary: List the caller's notifications
+      description: Bell popover; `meta.unreadCount` drives the dot and its aria-label.
+      parameters:
+        - { name: unread, in: query, required: false, schema: { type: boolean } }
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PageSize"
+      responses:
+        "200":
+          description: Newest first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotificationPage" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/notifications/{notificationId}/read:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - { name: notificationId, in: path, required: true, schema: { type: string }, example: ntf_1a2b3c }
+    post:
+      tags: [Notifications]
+      operationId: markNotificationRead
+      summary: Mark a notification as read
+      description: Clicking a notification in the popover.
+      responses:
+        "200":
+          description: Updated notification.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Notification" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/notification-preferences:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Notifications]
+      operationId: getNotificationPreferences
+      summary: Get the caller's notification preferences for this workspace
+      description: Settings → Stay in the loop.
+      responses:
+        "200":
+          description: Preferences.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotificationPreferences" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+    put:
+      tags: [Notifications]
+      operationId: updateNotificationPreferences
+      summary: Replace the caller's notification preferences
+      description: Settings → Save changes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NotificationPreferences" }
+      responses:
+        "200":
+          description: Saved preferences.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotificationPreferences" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationFailed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspaceId}/events:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Notifications]
+      operationId: streamEvents
+      summary: Live workspace events (Server-Sent Events)
+      description: |
+        Kept open by the web app while signed in. Each message is
+        `id: <eventId>` / `event: <type>` / `data: <RealtimeEvent JSON>`. A comment line (`: ping`) is sent
+        every 25 s. On reconnect the client sends `Last-Event-ID` and the server replays missed events
+        (up to 5 minutes). The client authenticates with the Bearer header (fetch-based reader).
+        Events are only delivered for things the caller may see.
+      parameters:
+        - { name: Last-Event-ID, in: header, required: false, schema: { type: string } }
+      responses:
+        "200":
+          description: Event stream (never ends normally).
+          content:
+            text/event-stream:
+              schema: { $ref: "#/components/schemas/RealtimeEvent" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  # ───────────────────────────── Search ─────────────────────────────
+  /workspaces/{workspaceId}/search:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      tags: [Search]
+      operationId: search
+      summary: Search posts, media and accounts
+      description: ⌘K search dialog. Implemented in the gateway by calling listPosts (q), listMedia (q) and listSocialAccounts in parallel and merging. Page results stay client-side.
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string, minLength: 1, maxLength: 200 }, example: spring }
+        - { name: types, in: query, required: false, description: "Comma-separated subset of post, media, account.", schema: { type: string, default: "post,media,account" } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 50, default: 8 } }
+      responses:
+        "200":
+          description: Results, best match first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/SearchResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Access token from identity-service (15 minutes, RS256). Claims: `sub` (user id), `email`,
+        `workspaces` (map of workspaceId → role), `exp`. Services verify it with the JWKS at
+        `/.well-known/jwks.json` and authorize workspace routes from the `workspaces` claim.
+
+  parameters:
+    WorkspaceId:
+      name: workspaceId
+      in: path
+      required: true
+      schema: { type: string }
+      example: ws_studio_north
+    PostId:
+      name: postId
+      in: path
+      required: true
+      schema: { type: string }
+      example: post_8f2c41
+    AccountId:
+      name: accountId
+      in: path
+      required: true
+      schema: { type: string }
+      example: acc_ig_main
+    MediaId:
+      name: mediaId
+      in: path
+      required: true
+      schema: { type: string }
+      example: med_room_to_grow
+    InvitationToken:
+      name: token
+      in: path
+      required: true
+      schema: { type: string }
+      example: inv_tk_5Jq2xW9
+    Page:
+      name: page
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: pageSize
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    SearchQuery:
+      name: q
+      in: query
+      required: false
+      description: Case-insensitive text search.
+      schema: { type: string, maxLength: 200 }
+    PlatformFilter:
+      name: platform
+      in: query
+      required: false
+      schema: { $ref: "#/components/schemas/Platform" }
+    PostStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Comma-separated post statuses.
+      schema: { type: string }
+      example: "failed,partially_published"
+    From:
+      name: from
+      in: query
+      required: false
+      description: Inclusive start date (YYYY-MM-DD) in the workspace timezone; filters on publishAt.
+      schema: { type: string, format: date }
+    To:
+      name: to
+      in: query
+      required: false
+      description: Inclusive end date (YYYY-MM-DD) in the workspace timezone; filters on publishAt.
+      schema: { type: string, format: date }
+    FromRequired:
+      name: from
+      in: query
+      required: true
+      description: Inclusive start date (YYYY-MM-DD) in the workspace timezone.
+      schema: { type: string, format: date }
+      example: "2026-03-01"
+    ToRequired:
+      name: to
+      in: query
+      required: true
+      description: Inclusive end date (YYYY-MM-DD) in the workspace timezone.
+      schema: { type: string, format: date }
+      example: "2026-03-23"
+    ExportFormat:
+      name: format
+      in: query
+      required: true
+      schema: { type: string, enum: [csv, pdf] }
+
+  responses:
+    BadRequest:
+      description: Malformed request (bad query parameter, unparseable body).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+          example:
+            error: { code: BAD_REQUEST, message: "Query parameter 'pageSize' must be between 1 and 100.", requestId: req_7Hk2p }
+    Unauthenticated:
+      description: Missing, invalid or expired credentials.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+          example:
+            error: { code: UNAUTHENTICATED, message: Your session has expired. Please sign in again., requestId: req_7Hk2q }
+    PaymentRequired:
+      description: The action needs a paid add-on.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+          example:
+            error: { code: PAYMENT_REQUIRED, message: "Instagram already has its included account. Connecting another needs an extra account slot (usable on any platform).", requestId: req_7Hk2r }
+    Forbidden:
+      description: Authenticated, but the role in the token doesn't allow this.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+          example:
+            error: { code: FORBIDDEN, message: Only admins can manage social accounts., requestId: req_7Hk2s }
+    NotFound:
+      description: The resource doesn't exist in this workspace.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+          example:
+            error: { code: NOT_FOUND, message: Post not found., requestId: req_7Hk2t }
+    Conflict:
+      description: The request conflicts with current state (`CONFLICT`, `INVALID_STATE`, `PLAN_LIMIT_REACHED`, `ACCOUNT_LOCKED`).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+          example:
+            error: { code: INVALID_STATE, message: Published posts can't be edited., requestId: req_7Hk2u }
+    ValidationFailed:
+      description: The body is well-formed but has invalid fields.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+          example:
+            error:
+              code: VALIDATION_FAILED
+              message: Some fields need attention.
+              details:
+                - { field: publishAt, message: Choose a time in the future. }
+              requestId: req_7Hk2v
+    InternalError:
+      description: Unexpected server error.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+          example:
+            error: { code: INTERNAL, message: Something went wrong on our side., requestId: req_7Hk2w }
+
+  schemas:
+    # ── Common ──
+    ErrorCode:
+      type: string
+      enum: [BAD_REQUEST, UNAUTHENTICATED, PAYMENT_REQUIRED, FORBIDDEN, NOT_FOUND, CONFLICT, INVALID_STATE, PLAN_LIMIT_REACHED, ACCOUNT_LOCKED, VALIDATION_FAILED, INTERNAL]
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field: { type: string, examples: [publishAt] }
+        message: { type: string, examples: [Choose a time in the future.] }
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code: { $ref: "#/components/schemas/ErrorCode" }
+            message: { type: string, description: Safe to show to the user. }
+            details:
+              type: array
+              items: { $ref: "#/components/schemas/FieldError" }
+            requestId: { type: string }
+    PageMeta:
+      type: object
+      required: [page, pageSize, total, totalPages]
+      properties:
+        page: { type: integer, minimum: 1, examples: [1] }
+        pageSize: { type: integer, minimum: 1, examples: [8] }
+        total: { type: integer, minimum: 0, examples: [24] }
+        totalPages: { type: integer, minimum: 0, examples: [3] }
+    DateRange:
+      type: object
+      required: [from, to]
+      properties:
+        from: { type: string, format: date, examples: ["2026-03-01"] }
+        to: { type: string, format: date, examples: ["2026-03-23"] }
+    UserRef:
+      type: object
+      required: [userId, name]
+      properties:
+        userId: { type: string, examples: [usr_maya] }
+        name: { type: string, examples: [Maya Chen] }
+    RedirectUrl:
+      type: object
+      required: [url]
+      properties:
+        url: { type: string, format: uri, examples: ["https://billing.stripe.com/p/session/test_YWNjdF8x"] }
+    Platform:
+      type: string
+      description: Platforms that can be connected today. TikTok, Pinterest and Threads are "coming soon" and are frontend constants.
+      enum: [instagram, linkedin, facebook, x, youtube]
+    Role:
+      type: string
+      enum: [owner, admin, editor]
+
+    # ── Identity ──
+    AuthProvider:
+      type: object
+      required: [id, name, kind]
+      properties:
+        id: { type: string, enum: [google, password] }
+        name: { type: string, examples: [Google] }
+        kind: { type: string, enum: [oauth, password] }
+    TokenRequest:
+      oneOf:
+        - $ref: "#/components/schemas/AuthorizationCodeGrant"
+        - $ref: "#/components/schemas/RefreshTokenGrant"
+      discriminator:
+        propertyName: grantType
+        mapping:
+          authorization_code: "#/components/schemas/AuthorizationCodeGrant"
+          refresh_token: "#/components/schemas/RefreshTokenGrant"
+    AuthorizationCodeGrant:
+      type: object
+      required: [grantType, code, codeVerifier, redirectUri]
+      properties:
+        grantType: { const: authorization_code }
+        code: { type: string }
+        codeVerifier: { type: string, minLength: 43, maxLength: 128 }
+        redirectUri: { type: string, format: uri }
+    RefreshTokenGrant:
+      type: object
+      required: [grantType]
+      description: The refresh token itself travels in the httpOnly `origin_refresh` cookie.
+      properties:
+        grantType: { const: refresh_token }
+    TokenResponse:
+      type: object
+      required: [accessToken, tokenType, expiresIn]
+      properties:
+        accessToken: { type: string }
+        tokenType: { const: Bearer }
+        expiresIn: { type: integer, description: Seconds., examples: [900] }
+    PasswordLoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, examples: [maya@studionorth.co] }
+        password: { type: string, format: password, minLength: 1 }
+    SignUpRequest:
+      type: object
+      required: [name, email, password, workspaceName]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 80, examples: [Maya Chen] }
+        email: { type: string, format: email, examples: [maya@studionorth.co] }
+        password: { type: string, format: password, minLength: 10 }
+        workspaceName: { type: string, minLength: 1, maxLength: 80, examples: [Studio North] }
+    PasswordResetRequest:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email }
+    PasswordResetConfirmRequest:
+      type: object
+      required: [token, password]
+      properties:
+        token: { type: string }
+        password: { type: string, format: password, minLength: 10 }
+    InvitationPreview:
+      type: object
+      required: [workspaceName, email, role, invitedBy, expiresAt, userExists]
+      properties:
+        workspaceName: { type: string, examples: [Studio North] }
+        email: { type: string, format: email, examples: [sam@studionorth.co] }
+        role: { $ref: "#/components/schemas/Role" }
+        invitedBy: { $ref: "#/components/schemas/UserRef" }
+        expiresAt: { type: string, format: date-time }
+        userExists: { type: boolean, description: True if an Origin user already has this email (they should sign in instead of creating a password). }
+    AcceptInvitationRequest:
+      type: object
+      description: Required fields only when the caller is not signed in.
+      properties:
+        name: { type: string, minLength: 1, maxLength: 80 }
+        password: { type: string, format: password, minLength: 10 }
+    User:
+      type: object
+      required: [id, name, initials, email, authProvider, createdAt]
+      properties:
+        id: { type: string, examples: [usr_maya] }
+        name: { type: string, examples: [Maya Chen] }
+        initials: { type: string, examples: [MC] }
+        email: { type: string, format: email, examples: [maya@studionorth.co] }
+        authProvider: { type: string, enum: [google, password] }
+        createdAt: { type: string, format: date-time }
+    Membership:
+      type: object
+      required: [workspaceId, role]
+      properties:
+        workspaceId: { type: string, examples: [ws_studio_north] }
+        role: { $ref: "#/components/schemas/Role" }
+    CurrentUser:
+      allOf:
+        - $ref: "#/components/schemas/User"
+        - type: object
+          required: [memberships]
+          properties:
+            memberships:
+              type: array
+              items: { $ref: "#/components/schemas/Membership" }
+    UpdateProfileRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1, maxLength: 80 }
+        email: { type: string, format: email }
+    Session:
+      type: object
+      required: [id, device, lastActiveAt, current]
+      properties:
+        id: { type: string, examples: [ses_31f0] }
+        device: { type: string, examples: [Chrome on macOS] }
+        location: { type: string, examples: ["Portland, US"] }
+        lastActiveAt: { type: string, format: date-time }
+        current: { type: boolean }
+    SecurityOverview:
+      type: object
+      required: [authProvider, twoFactor, sessions]
+      properties:
+        authProvider: { type: string, enum: [google, password] }
+        twoFactor:
+          description: Google accounts only (managed by Google); null for email/password accounts.
+          oneOf:
+            - type: "null"
+            - type: object
+              required: [managedBy, manageUrl]
+              properties:
+                managedBy: { const: google }
+                enabled: { type: [boolean, "null"], description: Null when Google doesn't report it. }
+                manageUrl: { type: string, format: uri, examples: ["https://myaccount.google.com/signinoptions/two-step-verification"] }
+        sessions:
+          type: array
+          items: { $ref: "#/components/schemas/Session" }
+
+    # ── Workspace ──
+    Plan:
+      type: object
+      required: [name, accountSlots, seats, extraSocialAccounts]
+      properties:
+        name: { type: string, examples: [Team] }
+        accountSlots: { type: integer, description: Social accounts included in the plan (one per platform is locked)., examples: [10] }
+        seats: { type: integer, examples: [5] }
+        extraSocialAccounts: { type: integer, description: "Paid add-on slots, usable on any platform, for a second (or later) account on a platform.", examples: [1] }
+    Workspace:
+      type: object
+      required: [id, name, initials, kind, slug, timezone, plan, seatsUsed, createdAt]
+      properties:
+        id: { type: string, examples: [ws_studio_north] }
+        name: { type: string, examples: [Studio North] }
+        initials: { type: string, examples: [SN] }
+        kind: { type: string, enum: [team, personal] }
+        slug: { type: string, pattern: "^[a-z0-9-]{3,40}$", examples: [studio-north] }
+        timezone: { type: string, description: IANA timezone used for scheduling and reports., examples: [America/Los_Angeles] }
+        plan: { $ref: "#/components/schemas/Plan" }
+        seatsUsed: { type: integer, examples: [3] }
+        createdAt: { type: string, format: date-time }
+    WorkspaceSummary:
+      type: object
+      required: [id, name, initials, kind, role]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        initials: { type: string }
+        kind: { type: string, enum: [team, personal] }
+        role: { $ref: "#/components/schemas/Role" }
+    CreateWorkspaceRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 80 }
+        timezone: { type: string, description: Defaults to the creator's browser timezone. }
+    UpdateWorkspaceRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1, maxLength: 80 }
+        slug: { type: string, pattern: "^[a-z0-9-]{3,40}$" }
+        timezone: { type: string }
+    Member:
+      type: object
+      required: [userId, name, initials, email, role, joinedAt]
+      properties:
+        userId: { type: string, examples: [usr_maya] }
+        name: { type: string, examples: [Maya Chen] }
+        initials: { type: string, examples: [MC] }
+        email: { type: string, format: email, examples: [maya@studionorth.co] }
+        role: { $ref: "#/components/schemas/Role" }
+        joinedAt: { type: string, format: date-time }
+    MemberPage:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Member" }
+        meta: { $ref: "#/components/schemas/PageMeta" }
+    UpdateMemberRequest:
+      type: object
+      required: [role]
+      properties:
+        role: { $ref: "#/components/schemas/Role" }
+    CreateInvitationRequest:
+      type: object
+      required: [email, role]
+      properties:
+        email: { type: string, format: email, examples: [sam@studionorth.co] }
+        role: { type: string, enum: [admin, editor] }
+    Invitation:
+      type: object
+      required: [id, email, role, status, invitedBy, expiresAt, createdAt]
+      properties:
+        id: { type: string, examples: [inv_5Jq2xW] }
+        email: { type: string, format: email }
+        role: { $ref: "#/components/schemas/Role" }
+        status: { type: string, enum: [pending, accepted, expired] }
+        invitedBy: { $ref: "#/components/schemas/UserRef" }
+        expiresAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+    BillingPortalRequest:
+      type: object
+      required: [returnUrl]
+      properties:
+        returnUrl: { type: string, format: uri }
+    CheckoutSessionRequest:
+      type: object
+      required: [item, successUrl, cancelUrl]
+      properties:
+        item: { type: string, enum: [extra_social_account] }
+        quantity: { type: integer, minimum: 1, maximum: 10, default: 1 }
+        successUrl: { type: string, format: uri }
+        cancelUrl: { type: string, format: uri }
+
+    # ── Accounts ──
+    AccountStatus:
+      type: string
+      description: "`not_connected` means the account's authorization was never completed or was revoked on the platform; the record (and its locked slot) remains."
+      enum: [connected, expires_soon, expired, not_connected]
+    SocialAccount:
+      type: object
+      required: [id, platform, handle, displayName, accountType, audience, audienceLabel, status, isDefault, isAddOn, permissions]
+      properties:
+        id: { type: string, examples: [acc_ig_main] }
+        platform: { $ref: "#/components/schemas/Platform" }
+        handle: { type: string, examples: ["@studionorth"] }
+        displayName: { type: string, examples: ["@studionorth"] }
+        accountType: { type: string, examples: [Business account] }
+        audience: { type: integer, examples: [12480] }
+        audienceLabel: { type: string, enum: [followers, subscribers] }
+        status: { $ref: "#/components/schemas/AccountStatus" }
+        isDefault: { type: boolean, description: "The platform's first connected account. Locked: it can't be disconnected or swapped, and Compose always publishes to it." }
+        isAddOn: { type: boolean, description: A paid extra account on a platform that already has its default. }
+        connectedBy: { oneOf: [{ $ref: "#/components/schemas/UserRef" }, { type: "null" }] }
+        connectedAt: { type: [string, "null"], format: date-time }
+        authorizationExpiresAt: { type: [string, "null"], format: date-time }
+        permissions:
+          type: array
+          items: { type: string }
+          examples: [["Create and publish content", "Read insights & account details"]]
+    StartConnectionRequest:
+      type: object
+      required: [platform, redirectUri]
+      properties:
+        platform: { $ref: "#/components/schemas/Platform" }
+        redirectUri: { type: string, format: uri, description: Where the callback finally lands (the web app /accounts page). }
+    ReconnectRequest:
+      type: object
+      required: [redirectUri]
+      properties:
+        redirectUri: { type: string, format: uri }
+    AuthorizationRedirect:
+      type: object
+      required: [authorizationUrl, state]
+      properties:
+        authorizationUrl: { type: string, format: uri, examples: ["https://www.linkedin.com/oauth/v2/authorization?response_type=code&client_id=77abc&state=st_91x"] }
+        state: { type: string, examples: [st_91x] }
+
+    # ── Content ──
+    PostStatus:
+      type: string
+      enum: [draft, scheduled, publishing, published, partially_published, failed]
+    DestinationStatus:
+      type: string
+      enum: [queued, scheduled, publishing, published, failed]
+    DestinationFormat:
+      type: string
+      description: "post (any platform), reel (Instagram, Facebook), native_video (LinkedIn), video_post (X), short (YouTube)."
+      enum: [post, reel, native_video, video_post, short]
+    MediaRef:
+      type: object
+      required: [id, name, kind, format, sizeBytes, width, height]
+      properties:
+        id: { type: string, examples: [med_room_to_grow] }
+        name: { type: string, examples: [room-to-grow.mp4] }
+        kind: { $ref: "#/components/schemas/MediaKind" }
+        format: { $ref: "#/components/schemas/MediaFormat" }
+        sizeBytes: { type: integer, examples: [18400000] }
+        durationSeconds: { type: [number, "null"], examples: [24] }
+        width: { type: integer, examples: [1080] }
+        height: { type: integer, examples: [1920] }
+        thumbnailUrl: { type: [string, "null"], format: uri }
+    DestinationError:
+      type: object
+      required: [code, title, detail]
+      properties:
+        code: { type: string, examples: [authorization_expired] }
+        title: { type: string, examples: [Authorization expired] }
+        detail: { type: string, examples: [No post was created on LinkedIn] }
+    Destination:
+      type: object
+      required: [id, accountId, platform, accountLabel, format, status]
+      properties:
+        id: { type: string, examples: [dst_4b7e10] }
+        accountId: { type: string, examples: [acc_li] }
+        platform: { $ref: "#/components/schemas/Platform" }
+        accountLabel: { type: string, description: Denormalized account display name., examples: [Studio North] }
+        format: { $ref: "#/components/schemas/DestinationFormat" }
+        captionOverride: { type: [string, "null"], description: "Caption used only for this platform (\"Edit for LinkedIn only\"). Null means use the post caption." }
+        title: { type: [string, "null"], description: YouTube video title., examples: ["A little room to grow | Studio North"] }
+        status: { $ref: "#/components/schemas/DestinationStatus" }
+        publishedAt: { type: [string, "null"], format: date-time }
+        externalUrl: { type: [string, "null"], format: uri }
+        error: { oneOf: [{ $ref: "#/components/schemas/DestinationError" }, { type: "null" }] }
+    Post:
+      type: object
+      required: [id, title, caption, media, mediaType, status, createdBy, createdAt, updatedAt, destinations]
+      properties:
+        id: { type: string, examples: [post_8f2c41] }
+        title: { type: string, description: Internal post name., examples: [A little room to grow] }
+        caption: { type: string }
+        link: { type: [string, "null"], format: uri, examples: ["https://studionorth.co/spring"] }
+        media:
+          type: array
+          items: { $ref: "#/components/schemas/MediaRef" }
+        mediaType: { type: [string, "null"], enum: [image, video, null], description: Derived from the first media item. }
+        status: { $ref: "#/components/schemas/PostStatus" }
+        publishAt: { type: [string, "null"], format: date-time, description: "Scheduled (or planned, for drafts) or actual publish time." }
+        createdBy: { $ref: "#/components/schemas/UserRef" }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        destinations:
+          type: array
+          items: { $ref: "#/components/schemas/Destination" }
+    PostPage:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Post" }
+        meta: { $ref: "#/components/schemas/PageMeta" }
+    DestinationInput:
+      type: object
+      required: [platform, format]
+      properties:
+        platform: { $ref: "#/components/schemas/Platform" }
+        format: { $ref: "#/components/schemas/DestinationFormat" }
+        captionOverride: { type: [string, "null"] }
+        title: { type: [string, "null"] }
+    PostInput:
+      type: object
+      required: [title]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 120 }
+        caption: { type: string, maxLength: 63206, default: "" }
+        link: { type: [string, "null"], format: uri }
+        mediaIds:
+          type: array
+          items: { type: string }
+        publishAt: { type: [string, "null"], format: date-time, description: Planned time for drafts. }
+        destinations:
+          type: array
+          items: { $ref: "#/components/schemas/DestinationInput" }
+    UpdatePostRequest:
+      type: object
+      minProperties: 1
+      properties:
+        title: { type: string, minLength: 1, maxLength: 120 }
+        caption: { type: string, maxLength: 63206 }
+        link: { type: [string, "null"], format: uri }
+        mediaIds:
+          type: array
+          items: { type: string }
+        publishAt: { type: [string, "null"], format: date-time }
+        destinations:
+          type: array
+          items: { $ref: "#/components/schemas/DestinationInput" }
+    SchedulePostRequest:
+      type: object
+      required: [publishAt]
+      properties:
+        publishAt: { type: string, format: date-time, examples: ["2026-03-24T17:00:00Z"] }
+    PostCounts:
+      type: object
+      required: [all, draft, scheduled, publishing, published, partiallyPublished, failed]
+      properties:
+        all: { type: integer, examples: [24] }
+        draft: { type: integer, examples: [6] }
+        scheduled: { type: integer, examples: [4] }
+        publishing: { type: integer, examples: [0] }
+        published: { type: integer, examples: [13] }
+        partiallyPublished: { type: integer, examples: [1] }
+        failed: { type: integer, examples: [0] }
+    PublishingStats:
+      type: object
+      required: [postsPublished, destinationSuccessRate, destinationsNeedingAttention, connectedPlatforms]
+      properties:
+        postsPublished: { type: integer, description: "Posts published in the period (status published or partially_published), not destinations.", examples: [12] }
+        destinationSuccessRate: { type: number, minimum: 0, maximum: 1, examples: [0.98] }
+        destinationsNeedingAttention: { type: integer, examples: [1] }
+        connectedPlatforms: { type: integer, examples: [5] }
+    HashtagSuggestionRequest:
+      type: object
+      required: [caption]
+      properties:
+        caption: { type: string, minLength: 1, maxLength: 63206 }
+        platforms:
+          type: array
+          items: { $ref: "#/components/schemas/Platform" }
+    HashtagSuggestions:
+      type: object
+      required: [hashtags]
+      properties:
+        hashtags:
+          type: array
+          items: { type: string, pattern: "^#\\S+$" }
+          examples: [["#StudioNorth", "#RoomToGrow"]]
+    CalendarEntry:
+      type: object
+      required: [postId, title, publishAt, status, platforms, mediaType]
+      properties:
+        postId: { type: string, examples: [post_8f2c41] }
+        title: { type: string, examples: [A little room to grow] }
+        publishAt: { type: string, format: date-time }
+        status: { $ref: "#/components/schemas/PostStatus" }
+        platforms:
+          type: array
+          items: { $ref: "#/components/schemas/Platform" }
+        mediaType: { type: [string, "null"], enum: [image, video, null] }
+
+    # ── Media ──
+    MediaKind:
+      type: string
+      enum: [image, video]
+    MediaFormat:
+      type: string
+      enum: [jpg, png, webp, mp4, mov]
+    MediaAsset:
+      type: object
+      required: [id, name, kind, format, mimeType, sizeBytes, width, height, folderId, url, status, usage, createdBy, createdAt]
+      properties:
+        id: { type: string, examples: [med_room_to_grow] }
+        name: { type: string, examples: [room-to-grow.mp4] }
+        kind: { $ref: "#/components/schemas/MediaKind" }
+        format: { $ref: "#/components/schemas/MediaFormat" }
+        mimeType: { type: string, examples: [video/mp4] }
+        sizeBytes: { type: integer, examples: [18400000] }
+        durationSeconds: { type: [number, "null"], examples: [24] }
+        width: { type: integer, examples: [1080] }
+        height: { type: integer, examples: [1920] }
+        folderId: { type: [string, "null"], examples: [fld_spring] }
+        url: { type: string, format: uri }
+        thumbnailUrl: { type: [string, "null"], format: uri }
+        status: { type: string, enum: [processing, ready, failed] }
+        usage:
+          type: object
+          required: [scheduledPostCount, postIds]
+          properties:
+            scheduledPostCount: { type: integer, examples: [1] }
+            postIds:
+              type: array
+              items: { type: string }
+        createdBy: { $ref: "#/components/schemas/UserRef" }
+        createdAt: { type: string, format: date-time }
+    MediaPage:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/MediaAsset" }
+        meta: { $ref: "#/components/schemas/PageMeta" }
+    UpdateMediaRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        folderId: { type: [string, "null"] }
+    CreateUploadRequest:
+      type: object
+      required: [fileName, contentType, sizeBytes]
+      properties:
+        fileName: { type: string, examples: [spring-still-life.jpg] }
+        contentType: { type: string, examples: [image/jpeg] }
+        sizeBytes: { type: integer, minimum: 1, maximum: 1000000000 }
+        folderId: { type: [string, "null"] }
+    UploadTicket:
+      type: object
+      required: [uploadId, uploadUrl, method, headers, expiresAt]
+      properties:
+        uploadId: { type: string, examples: [upl_92ac1f] }
+        uploadUrl: { type: string, format: uri }
+        method: { const: PUT }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+          examples: [{ Content-Type: image/jpeg }]
+        expiresAt: { type: string, format: date-time }
+    MediaFolder:
+      type: object
+      required: [id, name, assetCount]
+      properties:
+        id: { type: string, examples: [fld_spring] }
+        name: { type: string, examples: [Spring collection] }
+        assetCount: { type: integer, examples: [18] }
+    MediaFolderList:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/MediaFolder" }
+        meta:
+          type: object
+          required: [totalAssets]
+          properties:
+            totalAssets: { type: integer, examples: [48] }
+    CreateFolderRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 60 }
+    StorageUsage:
+      type: object
+      required: [usedBytes, limitBytes, maxFileBytes, allowedFormats]
+      properties:
+        usedBytes: { type: integer, examples: [1800000000] }
+        limitBytes: { type: integer, examples: [10000000000] }
+        maxFileBytes: { type: integer, examples: [1000000000] }
+        allowedFormats:
+          type: array
+          items: { $ref: "#/components/schemas/MediaFormat" }
+
+    # ── Analytics ──
+    Kpi:
+      type: object
+      required: [value, previous, change, changeUnit]
+      properties:
+        value: { type: number, examples: [128400] }
+        previous: { type: number, examples: [113830] }
+        change: { type: number, description: "Percent change, or percentage points for rates.", examples: [12.8] }
+        changeUnit: { type: string, enum: [percent, points] }
+    AnalyticsOverview:
+      type: object
+      required: [range, comparisonRange, updatedAt, kpis]
+      properties:
+        range: { $ref: "#/components/schemas/DateRange" }
+        comparisonRange: { $ref: "#/components/schemas/DateRange" }
+        updatedAt: { type: string, format: date-time }
+        kpis:
+          type: object
+          required: [impressions, engagements, engagementRate, audience]
+          properties:
+            impressions: { $ref: "#/components/schemas/Kpi" }
+            engagements: { $ref: "#/components/schemas/Kpi" }
+            engagementRate: { $ref: "#/components/schemas/Kpi" }
+            audience: { $ref: "#/components/schemas/Kpi" }
+        insight: { type: [string, "null"], examples: [Instagram Reels drove 41% of impressions during this period.] }
+    TimeseriesPoint:
+      type: object
+      required: [date, current, previous]
+      properties:
+        date: { type: string, format: date, examples: ["2026-03-01"] }
+        current: { type: number, examples: [2900] }
+        previous: { type: number, description: Value on the matching day of the comparison period., examples: [2000] }
+    PlatformMetrics:
+      type: object
+      required: [platform, impressions, engagements, engagementRate, audience]
+      properties:
+        platform: { $ref: "#/components/schemas/Platform" }
+        impressions: { type: integer, examples: [52400] }
+        engagements: { type: integer, examples: [2840] }
+        engagementRate: { type: number, description: Percent (engagements ÷ impressions × 100)., examples: [5.4] }
+        audience: { type: integer, examples: [10842] }
+    BestTimes:
+      type: object
+      required: [summary, slots]
+      properties:
+        summary: { type: string, examples: [Your audience is most active Tuesday and Thursday at 10 AM.] }
+        slots:
+          type: array
+          items:
+            type: object
+            required: [weekday, hour]
+            properties:
+              weekday: { type: integer, minimum: 0, maximum: 6, description: 0 = Sunday. }
+              hour: { type: integer, minimum: 0, maximum: 23 }
+
+    # ── Notifications ──
+    Notification:
+      type: object
+      required: [id, type, severity, title, detail, href, createdAt]
+      properties:
+        id: { type: string, examples: [ntf_1a2b3c] }
+        type: { type: string, enum: [account_expired, account_expires_soon, publish_succeeded, publish_partially_failed, publish_failed, invitation_accepted] }
+        severity: { type: string, enum: [success, warning, error, info] }
+        title: { type: string, examples: [LinkedIn authorization expired] }
+        detail: { type: string, examples: [Reconnect Studio North to resume scheduled publishing.] }
+        href: { type: string, description: In-app path to open., examples: [/accounts] }
+        readAt: { type: [string, "null"], format: date-time }
+        createdAt: { type: string, format: date-time }
+    NotificationPage:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Notification" }
+        meta:
+          allOf:
+            - $ref: "#/components/schemas/PageMeta"
+            - type: object
+              required: [unreadCount]
+              properties:
+                unreadCount: { type: integer, examples: [1] }
+    NotificationPreferences:
+      type: object
+      required: [publishingResults, accountHealth, scheduleReminders, weeklyInsights, emailEnabled]
+      properties:
+        publishingResults: { type: boolean, description: A summary after every publish. }
+        accountHealth: { type: boolean, description: Reconnect and permission alerts. }
+        scheduleReminders: { type: boolean, description: A daily look at what's coming up. }
+        weeklyInsights: { type: boolean, description: Performance summary every Monday. }
+        emailEnabled: { type: boolean, description: Also send enabled notifications by email. }
+
+    RealtimeEvent:
+      type: object
+      required: [id, type, occurredAt]
+      description: "One message on the event stream. Fields besides id/type/occurredAt depend on `type`."
+      properties:
+        id: { type: string, examples: [evt_01HQ7] }
+        type: { type: string, enum: [notification.created, post.updated, account.updated, metrics.updated] }
+        occurredAt: { type: string, format: date-time }
+        notification: { $ref: "#/components/schemas/Notification" }
+        postId: { type: string, description: "post.updated", examples: [post_8f2c41] }
+        postStatus: { $ref: "#/components/schemas/PostStatus" }
+        accountId: { type: string, description: "account.updated", examples: [acc_li] }
+        accountStatus: { $ref: "#/components/schemas/AccountStatus" }
+        metricsUpdatedAt: { type: string, format: date-time, description: "metrics.updated" }
+
+    # ── Search ──
+    SearchResult:
+      type: object
+      required: [type, id, label, hint, href]
+      properties:
+        type: { type: string, enum: [post, media, account] }
+        id: { type: string, examples: [post_8f2c41] }
+        label: { type: string, examples: [A little room to grow] }
+        hint: { type: string, examples: [Post · Scheduled] }
+        href: { type: string, examples: [/posts/post_8f2c41] }

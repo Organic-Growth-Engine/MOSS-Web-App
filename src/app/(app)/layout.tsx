@@ -1,5 +1,6 @@
 import { AppSidebar } from "@/components/layout/app-sidebar"
 import { AppTopbar, MobileHeader, MobileTabBar } from "@/components/layout/app-header"
+import { AuthGuard } from "@/components/auth/auth-guard"
 
 export default function AppLayout({ children }: LayoutProps<"/">) {
   return (
@@ -17,7 +18,7 @@ export default function AppLayout({ children }: LayoutProps<"/">) {
         id="main"
         className="mx-auto w-full max-w-[1280px] px-4 pt-6 pb-28 sm:px-6 lg:px-8 lg:pt-10 lg:pb-12"
       >
-        {children}
+        <AuthGuard>{children}</AuthGuard>
       </main>
       <MobileTabBar />
     </div>

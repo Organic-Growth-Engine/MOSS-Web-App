@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "api:lint": "npx @redocly/cli@2 lint --config docs/api/redocly.yaml docs/api/openapi.yaml"
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",

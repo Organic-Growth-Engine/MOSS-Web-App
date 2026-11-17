@@ -6,17 +6,14 @@ import { Search } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { mainNav } from "@/config/nav"
-import { accounts, media, posts } from "@/lib/data/mock"
+import { useSearch } from "@/lib/api/hooks/queries"
+import { useDebounced } from "@/hooks/use-debounced"
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog"
 
 type Result = { label: string; hint: string; href: string }
 
-const index: Result[] = [
-  ...mainNav.map((n) => ({ label: n.title, hint: "Page", href: n.href })),
-  ...posts.map((p) => ({ label: p.title, hint: `Post · ${p.campaign}`, href: `/posts/${p.id}` })),
-  ...media.map((m) => ({ label: m.name, hint: `Media · ${m.folder}`, href: "/media" })),
-  ...accounts.map((a) => ({ label: a.displayName, hint: `Account · ${a.accountType}`, href: "/accounts" })),
-]
+/** Pages are searched locally; posts, media and accounts come from the search API. */
+const pages: Result[] = mainNav.map((n) => ({ label: n.title, hint: "Page", href: n.href }))
 
 /** "Search posts, media, accounts… ⌘K" — the top bar search. */
 export function SearchTrigger({ className }: { className?: string }) {
@@ -55,10 +52,15 @@ export function SearchTrigger({ className }: { className?: string }) {
 function SearchDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o: boolean) => void }) {
   const router = useRouter()
   const [q, setQ] = useState("")
+  const term = useDebounced(q.trim(), 200)
+  const remote = useSearch(term)
   const results = useMemo(() => {
-    const s = q.trim().toLowerCase()
-    return (s ? index.filter((r) => r.label.toLowerCase().includes(s)) : index).slice(0, 8)
-  }, [q])
+    const s = term.toLowerCase()
+    if (!s) return pages.slice(0, 8)
+    const local = pages.filter((r) => r.label.toLowerCase().includes(s))
+    return [...local, ...(remote.data?.data ?? [])].slice(0, 8)
+  }, [term, remote.data])
+  const searching = q.trim() !== term || (Boolean(term) && remote.isFetching && !remote.data)
 
   return (
     <Dialog
@@ -82,8 +84,13 @@ function SearchDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o:
           />
         </div>
         <ul className="max-h-80 overflow-y-auto p-2">
+          {remote.isError && (
+            <li className="px-3 py-2 text-xs text-destructive">Search is unavailable right now. Showing pages only.</li>
+          )}
           {results.length === 0 && (
-            <li className="px-3 py-6 text-center text-sm text-muted-foreground">Nothing found.</li>
+            <li className="px-3 py-6 text-center text-sm text-muted-foreground">
+              {searching ? "Searching…" : "Nothing found."}
+            </li>
           )}
           {results.map((r) => (
             <li key={`${r.href}-${r.label}`}>

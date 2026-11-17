@@ -1,0 +1,8 @@
+# Lint config for docs/api/openapi.yaml:  npx @redocly/cli lint --config docs/api/redocly.yaml docs/api/openapi.yaml
+extends:
+  - recommended
+rules:
+  # authorize and the two OAuth callbacks are browser redirects: 302 is their only success response.
+  operation-2xx-response: off
+  # GET /auth/providers takes no input, so it has no 4xx case.
+  operation-4xx-response: off
