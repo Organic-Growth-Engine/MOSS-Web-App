@@ -1,21 +1,37 @@
 "use client"
 
+import { Suspense } from "react"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
 import { ArrowUpRight, CircleHelp } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { isActive, mainNav } from "@/config/nav"
-import { accounts, usedAccountSlots, workspace } from "@/lib/data/mock"
+import { useWorkspace } from "@/lib/api/hooks/workspace-context"
+import { usePostCounts, useSocialAccounts } from "@/lib/api/hooks/queries"
 import { Logo } from "@/components/shared/logo"
 import { WorkspaceSwitcher } from "@/components/layout/workspace-switcher"
 
 export function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
-  const pathname = usePathname()
+  // The pathname is unknown while prerendering dynamic routes; render without a highlight then.
+  return (
+    <Suspense fallback={<NavList pathname={null} onNavigate={onNavigate} />}>
+      <CurrentNavLinks onNavigate={onNavigate} />
+    </Suspense>
+  )
+}
+
+function CurrentNavLinks({ onNavigate }: { onNavigate?: () => void }) {
+  return <NavList pathname={usePathname()} onNavigate={onNavigate} />
+}
+
+function NavList({ pathname, onNavigate }: { pathname: string | null; onNavigate?: () => void }) {
+  const { data: counts } = usePostCounts()
+  const badges = { posts: counts?.all }
   return (
     <nav aria-label="Main" className="flex flex-col gap-1">
       {mainNav.map((item) => {
-        const active = isActive(pathname, item.href)
+        const active = pathname !== null && isActive(pathname, item.href)
         return (
           <Link
             key={item.href}
@@ -31,8 +47,8 @@ export function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
           >
             <item.icon className="size-[18px]" strokeWidth={1.75} aria-hidden />
             <span>{item.title}</span>
-            {item.badge !== undefined && (
-              <span className="text-xs font-normal text-muted-foreground">{item.badge}</span>
+            {item.badge && badges[item.badge] !== undefined && (
+              <span className="text-xs font-normal text-muted-foreground">{badges[item.badge]}</span>
             )}
           </Link>
         )
@@ -42,8 +58,12 @@ export function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
 }
 
 export function PlanCard() {
+  const { data: workspace } = useWorkspace()
+  const { data: accounts } = useSocialAccounts()
+  if (!workspace || !accounts) return <div aria-hidden className="h-[132px] rounded-xl bg-muted/70" />
   const total = workspace.plan.accountSlots
-  const needsReconnect = accounts.filter((a) => a.status === "expired").length
+  const usedAccountSlots = accounts.data.filter((a) => a.status !== "not_connected").length
+  const needsReconnect = accounts.data.filter((a) => a.status === "expired").length
   return (
     <div className="rounded-xl bg-muted/70 p-4 text-sm">
       <p className="font-semibold">A little more room.</p>
